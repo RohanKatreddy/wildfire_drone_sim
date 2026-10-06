@@ -38,6 +38,8 @@ GRASS_VARIANTS = [
         "scale_max": 1.2,
         "tint_min": 0.92,
         "tint_max": 1.05,
+        "placeholder_height": 0.32,
+        "placeholder_color": (0.3, 0.52, 0.18, 1.0),
     },
     {
         "name": "tall_grass",
@@ -49,6 +51,8 @@ GRASS_VARIANTS = [
         "scale_max": 1.8,
         "tint_min": 0.9,
         "tint_max": 1.02,
+        "placeholder_height": 0.6,
+        "placeholder_color": (0.4, 0.52, 0.22, 1.0),
     },
 ]
 
@@ -147,7 +151,7 @@ def _load_fire_truck_model():
             continue
 
         try:
-            loaded_model = app.loader.loadModel(str(candidate_path))
+            loaded_model = app.loader.loadModel(panda_path(candidate_path))
         except Exception:
             continue
 
@@ -184,7 +188,7 @@ def _load_fire_effect_model():
             continue
 
         try:
-            loaded_model = app.loader.loadModel(str(candidate_path))
+            loaded_model = app.loader.loadModel(panda_path(candidate_path))
         except Exception:
             continue
 
@@ -1386,31 +1390,318 @@ def trim_active_fire_hotspots():
         overflow_count -= 1
 
 
+# ----------------------------------------------------------------
+# Placeholder art, used when the downloaded models are not present
+# ----------------------------------------------------------------
+# Corner index bits 0/1/2 pick the +x/+y/+z side of a hexahedron.
+HEXAHEDRON_FACES = (
+    (0, 1, 3, 2),
+    (4, 6, 7, 5),
+    (0, 4, 5, 1),
+    (2, 3, 7, 6),
+    (0, 2, 6, 4),
+    (1, 5, 7, 3),
+)
+
+# Trunk height, then canopy tiers as (base z, bottom radius, top radius,
+# height), before the variant scale and TREE_HEIGHT_MULTIPLIER are applied.
+PLACEHOLDER_TREE_SHAPES = {
+    "tree_1": (
+        1.0,
+        ((0.45, 0.62, 0.0, 0.95), (0.95, 0.5, 0.0, 0.85), (1.45, 0.36, 0.0, 0.95)),
+        (0.13, 0.33, 0.15, 1.0),
+    ),
+    "tree_2": (
+        1.1,
+        ((0.5, 0.5, 0.0, 1.0), (1.1, 0.4, 0.0, 0.9), (1.65, 0.28, 0.0, 0.85)),
+        (0.16, 0.38, 0.17, 1.0),
+    ),
+    "tree_3": (
+        1.3,
+        ((1.0, 0.25, 0.6, 0.35), (1.35, 0.6, 0.62, 0.4), (1.75, 0.62, 0.0, 0.6)),
+        (0.24, 0.45, 0.18, 1.0),
+    ),
+}
+PLACEHOLDER_TRUNK_COLOR = (0.33, 0.23, 0.15, 1.0)
+
+
+def build_flat_shaded_mesh(name, triangles):
+    vertex_data = GeomVertexData(name, GeomVertexFormat.getV3n3c4(), Geom.UHStatic)
+    vertex_writer = GeomVertexWriter(vertex_data, "vertex")
+    normal_writer = GeomVertexWriter(vertex_data, "normal")
+    color_writer = GeomVertexWriter(vertex_data, "color")
+    primitive = GeomTriangles(Geom.UHStatic)
+
+    for triangle_index, (corners, color) in enumerate(triangles):
+        p0, p1, p2 = (Vec3(*corner) for corner in corners)
+        normal = (p1 - p0).cross(p2 - p0)
+        normal.normalize()
+        for corner in (p0, p1, p2):
+            vertex_writer.addData3(corner)
+            normal_writer.addData3(normal)
+            color_writer.addData4(*color)
+        first_vertex = triangle_index * 3
+        primitive.addVertices(first_vertex, first_vertex + 1, first_vertex + 2)
+
+    geom = Geom(vertex_data)
+    geom.addPrimitive(primitive)
+    geom_node = GeomNode(name)
+    geom_node.addGeom(geom)
+    return NodePath(geom_node)
+
+
+def hexahedron_triangles(corners, color):
+    corners = [Vec3(*corner) for corner in corners]
+    centroid = Vec3(0, 0, 0)
+    for corner in corners:
+        centroid += corner / 8.0
+
+    triangles = []
+    for face in HEXAHEDRON_FACES:
+        a, b, c, d = (corners[index] for index in face)
+        if (b - a).cross(c - a).dot(a - centroid) < 0.0:
+            a, b, c, d = d, c, b, a
+        triangles.append(((a, b, c), color))
+        triangles.append(((a, c, d), color))
+    return triangles
+
+
+def box_triangles(minimum, maximum, color):
+    return hexahedron_triangles(
+        [
+            (
+                maximum[0] if index & 1 else minimum[0],
+                maximum[1] if index & 2 else minimum[1],
+                maximum[2] if index & 4 else minimum[2],
+            )
+            for index in range(8)
+        ],
+        color,
+    )
+
+
+def beam_triangles(start, end, half_width, half_height, color):
+    start = Vec3(*start)
+    end = Vec3(*end)
+    side = (end - start).cross(Vec3(0, 0, 1))
+    if side.length() < 1e-6:
+        side = Vec3(1, 0, 0)
+    side.normalize()
+    lift = side.cross(end - start)
+    lift.normalize()
+    return hexahedron_triangles(
+        [
+            (end if index & 1 else start)
+            + side * (half_width if index & 2 else -half_width)
+            + lift * (half_height if index & 4 else -half_height)
+            for index in range(8)
+        ],
+        color,
+    )
+
+
+def frustum_triangles(center, bottom_radius, top_radius, height, color, segments=10):
+    """Capped frustum around +Z; a top radius of 0 makes a cone."""
+    center_x, center_y, base_z = center
+    top_z = base_z + height
+
+    def ring_point(angle, radius, z):
+        return (center_x + cos(angle) * radius, center_y + sin(angle) * radius, z)
+
+    triangles = []
+    for segment in range(segments):
+        angle_0 = tau * segment / segments
+        angle_1 = tau * (segment + 1) / segments
+        bottom_0 = ring_point(angle_0, bottom_radius, base_z)
+        bottom_1 = ring_point(angle_1, bottom_radius, base_z)
+        top_0 = ring_point(angle_0, top_radius, top_z)
+        top_1 = ring_point(angle_1, top_radius, top_z)
+        triangles.append(((bottom_0, bottom_1, top_1), color))
+        triangles.append((((center_x, center_y, base_z), bottom_1, bottom_0), color))
+        if top_radius > 0.0:
+            triangles.append(((bottom_0, top_1, top_0), color))
+            triangles.append((((center_x, center_y, top_z), top_0, top_1), color))
+    return triangles
+
+
+def build_placeholder_tree(variant_name):
+    trunk_height, canopy_tiers, canopy_color = PLACEHOLDER_TREE_SHAPES[variant_name]
+    prototype = NodePath(variant_name)
+    # Named like the trunk and leaf groups in Tree.obj so canopy sampling finds them.
+    build_flat_shaded_mesh(
+        "g1",
+        frustum_triangles((0, 0, 0), 0.07, 0.045, trunk_height, PLACEHOLDER_TRUNK_COLOR, 8),
+    ).reparentTo(prototype)
+    canopy_triangles = []
+    for base_z, bottom_radius, top_radius, tier_height in canopy_tiers:
+        canopy_triangles += frustum_triangles(
+            (0, 0, base_z),
+            bottom_radius,
+            top_radius,
+            tier_height,
+            canopy_color,
+        )
+    build_flat_shaded_mesh("g2", canopy_triangles).reparentTo(prototype)
+    return prototype
+
+
+def build_placeholder_grass_tuft(variant):
+    # Own RNG: the global one lays out the seeded forest.
+    blade_random = random.Random(variant["name"])
+    height = variant["placeholder_height"]
+    red, green, blue, alpha = variant["placeholder_color"]
+    triangles = []
+    blade_count = 8
+    for blade_index in range(blade_count):
+        angle = tau * blade_index / blade_count + blade_random.uniform(-0.3, 0.3)
+        direction = Vec3(cos(angle), sin(angle), 0)
+        side = Vec3(-sin(angle), cos(angle), 0) * 0.03
+        base = direction * blade_random.uniform(0.02, 0.09)
+        tip = (
+            base
+            + direction * blade_random.uniform(0.15, 0.4) * height
+            + Vec3(0, 0, height * blade_random.uniform(0.75, 1.0))
+        )
+        shade = blade_random.uniform(0.85, 1.1)
+        triangles.append(
+            ((base - side, base + side, tip), (red * shade, green * shade, blue * shade, alpha))
+        )
+
+    tuft = build_flat_shaded_mesh(variant["name"], triangles)
+    tuft.setTwoSided(True)
+    return tuft
+
+
+def build_placeholder_drone_model():
+    """Quadcopter authored Z-up with +Y forward, then counter-rotated so the
+    pitch and heading offsets build_drone_rig applies for the OBJ leave it level."""
+    body_color = (0.85, 0.86, 0.88, 1.0)
+    frame_color = (0.2, 0.2, 0.22, 1.0)
+    guard_color = (0.55, 0.56, 0.6, 1.0)
+    bottom_z = -0.9
+    top_z = 0.6
+    guard_radius = DRONE_PROPELLER_BLADE_HALF_LENGTH + 0.12
+    guard_half_width = 0.05
+    guard_reach = guard_radius + guard_half_width
+
+    # build_drone_propellers puts the rotors at fixed fractions of the model
+    # bounds, which the prop guards set; put the motors where those land.
+    motor_x = (
+        2.0 * DRONE_PROPELLER_X_OFFSET_FACTOR * guard_reach
+        / (1.0 - 2.0 * DRONE_PROPELLER_X_OFFSET_FACTOR)
+    )
+    motor_y = (
+        2.0 * DRONE_PROPELLER_Z_OFFSET_FACTOR * guard_reach
+        / (1.0 - 2.0 * DRONE_PROPELLER_Z_OFFSET_FACTOR)
+    )
+    rotor_z = top_z - (top_z - bottom_z) * DRONE_PROPELLER_Y_TOP_MARGIN_FACTOR
+
+    triangles = []
+    triangles += box_triangles((-0.95, -1.25, -0.25), (0.95, 1.25, 0.45), body_color)
+    triangles += box_triangles((-0.6, -0.8, 0.45), (0.6, 0.7, top_z), frame_color)
+    # Dark camera pod and an orange stripe mark the nose.
+    triangles += box_triangles((-0.3, 1.25, -0.15), (0.3, 1.6, 0.25), frame_color)
+    triangles += box_triangles((-0.5, 1.0, 0.45), (0.5, 1.25, 0.5), (0.95, 0.45, 0.1, 1.0))
+
+    for side_x in (-1.0, 1.0):
+        for side_y in (-1.0, 1.0):
+            motor_center = (side_x * motor_x, side_y * motor_y)
+            triangles += beam_triangles(
+                (side_x * 0.7, side_y * 0.9, 0.05),
+                (motor_center[0], motor_center[1], rotor_z - 0.12),
+                0.14,
+                0.08,
+                frame_color,
+            )
+            triangles += frustum_triangles(
+                (motor_center[0], motor_center[1], rotor_z - 0.35),
+                0.28,
+                0.24,
+                0.35,
+                frame_color,
+            )
+            guard_segments = 16
+            for segment in range(guard_segments):
+                angle_0 = tau * segment / guard_segments
+                angle_1 = tau * (segment + 1) / guard_segments
+                triangles += beam_triangles(
+                    (
+                        motor_center[0] + cos(angle_0) * guard_radius,
+                        motor_center[1] + sin(angle_0) * guard_radius,
+                        rotor_z,
+                    ),
+                    (
+                        motor_center[0] + cos(angle_1) * guard_radius,
+                        motor_center[1] + sin(angle_1) * guard_radius,
+                        rotor_z,
+                    ),
+                    guard_half_width,
+                    0.06,
+                    guard_color,
+                )
+
+        # Landing gear: two legs and a skid on each side.
+        for leg_y in (-0.7, 0.7):
+            triangles += beam_triangles(
+                (side_x * 0.6, leg_y, -0.25),
+                (side_x * 0.75, leg_y, bottom_z + 0.05),
+                0.05,
+                0.05,
+                frame_color,
+            )
+        triangles += beam_triangles(
+            (side_x * 0.75, -1.1, bottom_z + 0.05),
+            (side_x * 0.75, 1.1, bottom_z + 0.05),
+            0.05,
+            0.05,
+            frame_color,
+        )
+
+    drone_model = NodePath("drone_placeholder")
+    geometry = build_flat_shaded_mesh("drone_placeholder_geometry", triangles)
+    geometry.reparentTo(drone_model)
+    geometry.setTransform(
+        TransformState.makeHpr(
+            Vec3(DRONE_MODEL_HEADING_OFFSET_DEGREES, DRONE_BASE_PITCH_DEGREES, 0)
+        ).getInverse()
+    )
+    return drone_model
+
+
 def build_tree_prototypes():
     prototypes = []
 
+    tree_model_missing = not Path(TREE_BASE_MODEL_PATH).exists()
     bark_textures = {}
     leaf_textures = {}
-    for variant in TREE_VARIANTS:
-        bark_texture_path = variant["bark_texture"]
-        leaf_texture_path = variant["leaf_texture"]
-        bark_textures[bark_texture_path] = app.loader.loadTexture(bark_texture_path)
-        leaf_textures[leaf_texture_path] = app.loader.loadTexture(leaf_texture_path)
+    if tree_model_missing:
+        report_missing_asset(TREE_BASE_MODEL_PATH)
+    else:
+        for variant in TREE_VARIANTS:
+            bark_texture_path = variant["bark_texture"]
+            leaf_texture_path = variant["leaf_texture"]
+            bark_textures[bark_texture_path] = load_optional_texture(bark_texture_path)
+            leaf_textures[leaf_texture_path] = load_optional_texture(leaf_texture_path)
 
     for variant in TREE_VARIANTS:
-        prototype = app.loader.loadModel(TREE_BASE_MODEL_PATH)
+        if tree_model_missing:
+            prototype = build_placeholder_tree(variant["name"])
+        else:
+            prototype = app.loader.loadModel(panda_path(TREE_BASE_MODEL_PATH))
+            prototype.setP(variant["pitch"])
         prototype.setName(variant["name"])
-        prototype.setP(variant["pitch"])
         prototype.setScale(variant["scale"] * TREE_HEIGHT_MULTIPLIER)
 
         trunk = prototype.find("**/g1")
         leaves = prototype.find("**/g2")
+        bark_texture = bark_textures.get(variant["bark_texture"])
+        leaf_texture = leaf_textures.get(variant["leaf_texture"])
 
-        if not trunk.isEmpty():
-            trunk.setTexture(bark_textures[variant["bark_texture"]], 1)
+        if not trunk.isEmpty() and bark_texture is not None:
+            trunk.setTexture(bark_texture, 1)
 
-        if not leaves.isEmpty():
-            leaves.setTexture(leaf_textures[variant["leaf_texture"]], 1)
+        if not leaves.isEmpty() and leaf_texture is not None:
+            leaves.setTexture(leaf_texture, 1)
             leaves.setTransparency(TransparencyAttrib.MDual, 1)
             leaves.setTwoSided(True)
 
@@ -1464,18 +1755,22 @@ def build_grass_prototypes():
     prototypes = []
 
     for variant in GRASS_VARIANTS:
-        prototype = app.loader.loadModel(variant["path"])
+        if Path(variant["path"]).exists():
+            prototype = app.loader.loadModel(panda_path(variant["path"]))
 
-        for junk_name in ("**/Camera", "**/Plane", "**/ground"):
-            junk = prototype.find(junk_name)
-            if not junk.isEmpty():
-                junk.removeNode()
+            for junk_name in ("**/Camera", "**/Plane", "**/ground"):
+                junk = prototype.find(junk_name)
+                if not junk.isEmpty():
+                    junk.removeNode()
 
-        prototype.setTransparency(TransparencyAttrib.MDual, 1)
-        prototype.setTwoSided(True)
-        prototype.setTexture(load_cutout_grass_texture(variant["texture"]), 1)
-        prototype.setScale(variant["base_scale"])
-        prototype.setP(variant["base_pitch"])
+            prototype.setTransparency(TransparencyAttrib.MDual, 1)
+            prototype.setTwoSided(True)
+            prototype.setTexture(load_cutout_grass_texture(variant["texture"]), 1)
+            prototype.setScale(variant["base_scale"])
+            prototype.setP(variant["base_pitch"])
+        else:
+            report_missing_asset(variant["path"])
+            prototype = build_placeholder_grass_tuft(variant)
         snap_bottom_to_ground(prototype)
         prototype.flattenLight()
 
@@ -1704,7 +1999,12 @@ def build_drone_propellers(drone_model):
 def build_drone_rig(root_name, tint_rgba=None):
     drone_root = app.render.attachNewNode(root_name)
     drone_visual = drone_root.attachNewNode(f"{root_name}_visual")
-    drone_model = app.loader.loadModel(asset_path("models/Drone_Costum/Material/drone_costum.obj"))
+    drone_model_path = asset_path("models/Drone_Costum/Material/drone_costum.obj")
+    if Path(drone_model_path).exists():
+        drone_model = app.loader.loadModel(panda_path(drone_model_path))
+    else:
+        report_missing_asset(drone_model_path)
+        drone_model = build_placeholder_drone_model()
     drone_model.reparentTo(drone_visual)
     drone_propellers = build_drone_propellers(drone_model)
     drone_model.setScale(DRONE_MODEL_SCALE)

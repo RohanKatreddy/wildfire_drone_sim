@@ -19,7 +19,13 @@ from panda3d.core import (
     CollisionRay,
     CollisionTraverser,
     DirectionalLight,
+    Filename,
+    Geom,
     GeomNode,
+    GeomTriangles,
+    GeomVertexData,
+    GeomVertexFormat,
+    GeomVertexWriter,
     GeoMipTerrain,
     InputDevice,
     LineSegs,
@@ -34,6 +40,7 @@ from panda3d.core import (
     Texture,
     TextureStage,
     TextNode,
+    TransformState,
     TransparencyAttrib,
     Vec3,
     loadPrcFileData,
@@ -1017,6 +1024,11 @@ DETECTION_ALARM_SOUND_PATH = PROJECT_ROOT / "audio" / "swarm_alarm.wav"
 DETECTION_ALARM_COOLDOWN_SECONDS = 4.0
 
 
+def panda_path(path):
+    # Panda3D cannot open Windows paths like C:\...; it expects /c/... form.
+    return Filename.fromOsSpecific(str(path)).getFullpath()
+
+
 # Keep startup logs useful without noisy model warnings.
 if os.environ.get("REAL_SIM_HEADLESS", "0") == "1":
     loadPrcFileData("", "window-type none")
@@ -1026,7 +1038,8 @@ loadPrcFileData("", f"clock-frame-rate {REAL_SIM_MAX_FPS}")
 loadPrcFileData("", "sync-video true")
 if REAL_SIM_CLIENT_SLEEP_SECONDS > 0.0:
     loadPrcFileData("", f"client-sleep {REAL_SIM_CLIENT_SLEEP_SECONDS:.4f}")
-loadPrcFileData("", f'model-cache-dir "{PROJECT_ROOT / ".panda3d-cache"}"')
+# No quotes: Panda3D keeps them as part of the path, which disabled the cache.
+loadPrcFileData("", f"model-cache-dir {panda_path(PROJECT_ROOT / '.panda3d-cache')}")
 
 
 def asset_path(relative_path):
@@ -1034,6 +1047,29 @@ def asset_path(relative_path):
     if local_path.exists():
         return str(local_path)
     return str(FOREST_SIM_ROOT / relative_path)
+
+
+# The public repo ships without the tree, grass, drone and ground-texture
+# assets, so each missing file is reported once and a placeholder stands in.
+reported_missing_assets = set()
+
+
+def report_missing_asset(path):
+    if path in reported_missing_assets:
+        return
+    reported_missing_assets.add(path)
+    try:
+        shown_path = Path(path).relative_to(FOREST_SIM_ROOT)
+    except ValueError:
+        shown_path = path
+    print(f"Missing asset {shown_path}; using a placeholder.")
+
+
+def load_optional_texture(texture_path):
+    if not Path(texture_path).exists():
+        report_missing_asset(texture_path)
+        return None
+    return app.loader.loadTexture(panda_path(texture_path))
 
 
 # ---------
@@ -1052,7 +1088,7 @@ def load_detection_alarm():
         alarm_sound = None
         return
     try:
-        alarm_sound = app.loader.loadSfx(str(DETECTION_ALARM_SOUND_PATH))
+        alarm_sound = app.loader.loadSfx(panda_path(DETECTION_ALARM_SOUND_PATH))
         if alarm_sound is not None:
             alarm_sound.setVolume(0.9)
     except Exception:
@@ -1245,7 +1281,7 @@ def load_baked_fire_textures():
 
     loaded_textures = []
     for frame_path in frame_paths:
-        texture = app.loader.loadTexture(str(frame_path))
+        texture = app.loader.loadTexture(panda_path(frame_path))
         if texture is None:
             continue
         texture.setWrapU(SamplerState.WM_clamp)
@@ -1303,7 +1339,7 @@ def load_baked_fire_mesh_prototypes():
     loaded_models = []
     for frame_path in frame_paths:
         try:
-            model = app.loader.loadModel(str(frame_path))
+            model = app.loader.loadModel(panda_path(frame_path))
         except Exception:
             continue
         if model is None or model.isEmpty():
@@ -1352,15 +1388,15 @@ def load_cutout_grass_texture(texture_path):
             texture_path,
             cache_path,
         ):
-            texture = app.loader.loadTexture(str(cache_path))
+            texture = app.loader.loadTexture(panda_path(cache_path))
             if texture is not None:
                 texture = configure_clamped_texture(texture)
                 grass_texture_cache[texture_path] = texture
                 return texture
 
     image = PNMImage()
-    if not image.read(texture_path):
-        texture = app.loader.loadTexture(texture_path)
+    if not image.read(panda_path(texture_path)):
+        texture = app.loader.loadTexture(panda_path(texture_path))
         texture = configure_clamped_texture(texture)
         grass_texture_cache[texture_path] = texture
         return texture
@@ -1387,7 +1423,7 @@ def load_cutout_grass_texture(texture_path):
     if cache_path is not None:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            image.write(str(cache_path))
+            image.write(panda_path(cache_path))
         except Exception:
             pass
 
@@ -1396,7 +1432,7 @@ def load_cutout_grass_texture(texture_path):
         if cache_path is not None and cache_path.exists()
         else texture_path
     )
-    texture = app.loader.loadTexture(fallback_texture_path)
+    texture = app.loader.loadTexture(panda_path(fallback_texture_path))
     if texture is None:
         texture = Texture(Path(texture_path).stem)
     texture.load(image)
@@ -1405,8 +1441,33 @@ def load_cutout_grass_texture(texture_path):
     return texture
 
 
+def build_placeholder_ground_texture(size=128):
+    cached_texture = procedural_texture_cache.get("placeholder_ground")
+    if cached_texture is not None:
+        return cached_texture
+
+    # Own RNG: the global one lays out the seeded forest.
+    speckle_random = random.Random("placeholder_ground")
+    image = PNMImage(size, size, 3)
+    for y in range(size):
+        for x in range(size):
+            u = x / size
+            v = y / size
+            # Whole-number frequencies keep the mottling seamless when tiled.
+            patch = 0.5 * sin(tau * (3.0 * u + v)) + 0.5 * cos(tau * (2.0 * v - u))
+            shade = patch * 0.06 + speckle_random.uniform(-0.035, 0.035)
+            image.setXel(x, y, 0.24 + shade * 0.6, 0.42 + shade, 0.16 + shade * 0.4)
+
+    texture = Texture("placeholder_ground")
+    texture.load(image)
+    procedural_texture_cache["placeholder_ground"] = texture
+    return texture
+
+
 def apply_repeating_texture(node_path, texture_path, u_scale, v_scale):
-    texture = app.loader.loadTexture(asset_path(texture_path))
+    texture = load_optional_texture(asset_path(texture_path))
+    if texture is None:
+        texture = build_placeholder_ground_texture()
     texture.setWrapU(SamplerState.WM_repeat)
     texture.setWrapV(SamplerState.WM_repeat)
     node_path.setTexture(texture, 1)
@@ -1536,7 +1597,7 @@ def build_ground():
         return build_procedural_mountain_terrain(), True
 
     if USE_TERRAIN_MODEL:
-        terrain = app.loader.loadModel(asset_path("models/89-terrain/uploads_files_2708212_terrain.fbx"))
+        terrain = app.loader.loadModel(panda_path(asset_path("models/89-terrain/uploads_files_2708212_terrain.fbx")))
         terrain.reparentTo(app.render)
         terrain.setP(90)
         terrain.setScale(TERRAIN_SCALE)
